@@ -13,7 +13,12 @@ inputs:
   owner:
     required: false
     type: string
-    default: ${{ github.repository_owner }} 
+    default: ${{ github.repository_owner }}
+  days_old:
+    description: "Only delete versions older than this many days (0 for all)"
+    required: false
+    type: string
+    default: "0"
 runs:
   using: 'composite'
   steps:
@@ -25,6 +30,14 @@ runs:
         script: |
           const owner = '${{ inputs.owner }}';
           const packageList = '${{ inputs.packages }}'.split(',').map(pkg => pkg.trim());
+          const daysOld = parseInt('${{ inputs.days_old }}') || 0;
+          const cutoffDate = new Date();
+          cutoffDate.setDate(cutoffDate.getDate() - daysOld);
+          
+          console.log(`Current time: ${new Date().toISOString()}`);
+          if (daysOld > 0) {
+            console.log(`Only deleting versions older than ${daysOld} days (before ${cutoffDate.toISOString()})`);
+          }
           
           // Process each package
           for (const packageName of packageList) {
@@ -40,44 +53,79 @@ runs:
                   org: owner
                 });
                 ownerType = 'org';
+                console.log(`Owner type determined as: organization`);
               } catch (err) {
                 if (err.status === 404) {
                   ownerType = 'user';
+                  console.log(`Owner type determined as: user`);
                 } else {
                   throw err;
                 }
               }
               
-              console.log(`Owner type determined as: ${ownerType}`);
-              
-              // Get package versions
-              let packageVersions;
-              if (ownerType === 'org') {
-                const response = await github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg({
-                  package_type: 'container',
-                  package_name: packageName,
-                  org: owner
-                });
-                packageVersions = response.data;
-              } else {
-                const response = await github.rest.packages.getAllPackageVersionsForPackageOwnedByUser({
-                  package_type: 'container',
-                  package_name: packageName,
-                  username: owner
-                });
-                packageVersions = response.data;
+              // Get all package versions with pagination support
+              async function getAllPackageVersions() {
+                let allVersions = [];
+                let page = 1;
+                let hasMorePages = true;
+                
+                while (hasMorePages) {
+                  try {
+                    let response;
+                    if (ownerType === 'org') {
+                      response = await github.rest.packages.getAllPackageVersionsForPackageOwnedByOrg({
+                        package_type: 'container',
+                        package_name: packageName,
+                        org: owner,
+                        per_page: 100,
+                        page: page
+                      });
+                    } else {
+                      response = await github.rest.packages.getAllPackageVersionsForPackageOwnedByUser({
+                        package_type: 'container',
+                        package_name: packageName,
+                        username: owner,
+                        per_page: 100,
+                        page: page
+                      });
+                    }
+                    
+                    if (response.data && response.data.length > 0) {
+                      allVersions = allVersions.concat(response.data);
+                      if (response.data.length < 100) {
+                        hasMorePages = false;
+                      } else {
+                        page++;
+                      }
+                    } else {
+                      hasMorePages = false;
+                    }
+                  } catch (err) {
+                    console.error(`Error fetching page ${page}: ${err.message}`);
+                    hasMorePages = false;
+                  }
+                }
+                
+                return allVersions;
               }
               
-              console.log(`Found ${packageVersions.length} package versions for ${packageName}`);
+              const packageVersions = await getAllPackageVersions();
+              console.log(`Found ${packageVersions.length} total package versions for ${packageName}`);
               
               // Process each package version
               let successCount = 0;
               let failCount = 0;
               let skipCount = 0;
+              let skipCountTag = 0;
+              let skipCountDate = 0;
               
               for (const version of packageVersions) {
-                if (!version.metadata.container.tags || version.metadata.container.tags.length === 0) {
-                  console.log(`Attempting to delete untagged version ${version.id}`);
+                const createdAt = new Date(version.created_at);
+                const isOldEnough = daysOld === 0 || createdAt < cutoffDate;
+                const hasNoTags = !version.metadata.container.tags || version.metadata.container.tags.length === 0;
+                
+                if (hasNoTags && isOldEnough) {
+                  console.log(`Attempting to delete untagged version ${version.id} created at ${createdAt.toISOString()} (SHA: ${version.name.substring(0, 12)}...)`);
                   
                   try {
                     if (ownerType === 'org') {
@@ -100,10 +148,33 @@ runs:
                     successCount++;
                   } catch (deleteErr) {
                     console.log(`Failed to delete version ${version.id}: ${deleteErr.message}`);
-                    failCount++;
+                    
+                    // Try a different approach for stubborn packages
+                    try {
+                      const endpoint = ownerType === 'org' 
+                        ? `DELETE /orgs/${owner}/packages/container/${packageName}/versions/${version.id}` 
+                        : `DELETE /users/${owner}/packages/container/${packageName}/versions/${version.id}`;
+                        
+                      await github.request(endpoint, {
+                        headers: {
+                          'X-GitHub-Api-Version': '2022-11-28'
+                        }
+                      });
+                      console.log(`Successfully deleted version ${version.id} using alternative method`);
+                      successCount++;
+                    } catch (altErr) {
+                      console.log(`Alternative deletion also failed: ${altErr.message}`);
+                      failCount++;
+                    }
                   }
                 } else {
-                  console.log(`Skipping version ${version.id} as it has ${version.metadata.container.tags.length} tags`);
+                  if (!isOldEnough) {
+                    console.log(`Skipping version ${version.id} as it's newer than ${daysOld} days old (created at ${createdAt.toISOString()})`);
+                    skipCountDate++;
+                  } else {
+                    console.log(`Skipping version ${version.id} as it has ${version.metadata.container.tags.length} tag(s): ${version.metadata.container.tags.join(', ')}`);
+                    skipCountTag++;
+                  }
                   skipCount++;
                 }
               }
@@ -111,7 +182,9 @@ runs:
               console.log(`\n===== Package ${packageName} Summary =====`);
               console.log(`Deleted: ${successCount}`);
               console.log(`Failed: ${failCount}`);
-              console.log(`Skipped (tagged): ${skipCount}`);
+              console.log(`Skipped total: ${skipCount}`);
+              console.log(`  - With tags: ${skipCountTag}`);
+              console.log(`  - Too new: ${skipCountDate}`);
               console.log(`============================`);
               
             } catch (error) {
